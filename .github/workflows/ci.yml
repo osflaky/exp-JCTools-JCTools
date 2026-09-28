@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }}, JDK ${{ matrix.java }}) [${{ 
+      matrix.expander_leg }}]
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - os: windows-latest
+          java: 21
+          arch: arm64
+          runner: windows-11-arm
+          expander_leg: windows-latest-21-arm64
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v7
+
+    - name: Set up JDK ${{ matrix.java }}
+      uses: actions/setup-java@v5
+      with:
+        distribution: ${{ matrix.distribution || 'temurin' }}
+        java-version: ${{ matrix.java }}
+        cache: maven
+
+    - name: Build
+      run: mvn install -DskipTests -q
+
+    - name: Test
+      run: mvn test -pl jctools-build,jctools-core,jctools-core-jdk11
+    timeout-minutes: 150
