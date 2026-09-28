@@ -1,0 +1,450 @@
+package org.jctools.queues.util;
+
+import com.github.javaparser.ast.ImportDeclaration;
+import com.github.javaparser.ast.Modifier;
+import com.github.javaparser.ast.Node;
+import com.github.javaparser.ast.NodeList;
+import com.github.javaparser.ast.PackageDeclaration;
+import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
+import com.github.javaparser.ast.body.FieldDeclaration;
+import com.github.javaparser.ast.body.InitializerDeclaration;
+import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.body.Parameter;
+import com.github.javaparser.ast.comments.Comment;
+import com.github.javaparser.ast.expr.AssignExpr;
+import com.github.javaparser.ast.expr.Expression;
+import com.github.javaparser.ast.expr.MarkerAnnotationExpr;
+import com.github.javaparser.ast.expr.MethodCallExpr;
+import com.github.javaparser.ast.expr.NameExpr;
+import com.github.javaparser.ast.expr.SimpleName;
+import com.github.javaparser.ast.stmt.BlockStmt;
+import com.github.javaparser.ast.stmt.ExpressionStmt;
+import com.github.javaparser.ast.stmt.ReturnStmt;
+import com.github.javaparser.ast.type.ArrayType;
+import com.github.javaparser.ast.type.ClassOrInterfaceType;
+import com.github.javaparser.ast.type.Type;
+import com.github.javaparser.ast.visitor.VoidVisitorAdapter;
+
+import java.util.Optional;
+
+import static org.jctools.queues.util.GeneratorUtils.cleanupPaddingComments;
+import static org.jctools.queues.util.GeneratorUtils.formatMultilineJavadoc;
+import static org.jctools.queues.util.GeneratorUtils.removePaddingFields;
+import static org.jctools.queues.util.GeneratorUtils.renameType;
+
+/**
+ * Shared base for the JCTools queue generators: holds the visitor machinery, name-translation
+ * rules, parent-class renamer, and AST construction helpers that the atomic, VarHandle, and
+ * unpadded hierarchies all need. Concrete generators pass a {@link #queueClassNamePrefix} (the
+ * infix spliced into translated names — {@code "Atomic"}, {@code "VarHandle"}, {@code "Unpadded"},
+ * {@code "AtomicUnpadded"}, {@code "VarHandleUnpadded"}) and an {@link #outputPackage} via the
+ * constructor, plus their own AST rewrites in subclass-specific {@code visit(...)} overrides.
+ * <p>
+ * These generators are coupled with the structure and naming of fields, variables, and methods in
+ * the JCTools queue sources and are not suitable for general-purpose use.
+ */
+public abstract class JavaParsingQueueGeneratorBase extends VoidVisitorAdapter<Void>
+    implements JCToolsGenerator
+{
+
+    /**
+     * When set on a class using a single-line comment, the class has fields that have unsafe
+     * 'ordered' reads and writes. These fields are candidates to be patched by the atomic and
+     * VarHandle generators.
+     */
+    protected static final String GEN_DIRECTIVE_CLASS_CONTAINS_ORDERED_FIELD_ACCESSORS = "$gen:ordered-fields";
+
+    /**
+     * When set on a method using a single-line comment, the method is removed by the generator.
+     */
+    protected static final String GEN_DIRECTIVE_METHOD_IGNORE = "$gen:ignore";
+
+    protected final String sourceFileName;
+
+    /** The output package for files this generator produces. E.g. {@code "org.jctools.queues.atomic"}. */
+    protected final String outputPackage;
+
+    /**
+     * The infix spliced into translated class names by {@link #translateQueueName(String)} —
+     * e.g. {@code "Atomic"} so {@code SpscArrayQueue} becomes {@code SpscAtomicArrayQueue}.
+     */
+    protected final String queueClassNamePrefix;
+
+    protected JavaParsingQueueGeneratorBase(String sourceFileName, String outputPackage, String queueClassNamePrefix)
+    {
+        this.sourceFileName = sourceFileName;
+        this.outputPackage = outputPackage;
+        this.queueClassNamePrefix = queueClassNamePrefix;
+    }
+
+    @Override
+    public final String translateQueueName(String qName)
+    {
+        if (qName.contains("LinkedQueue") || qName.contains("LinkedArrayQueue"))
+        {
+            return qName.replace("Linked", "Linked" + queueClassNamePrefix);
+        }
+        // ArrayQueue check must come before Chunk check because some inner hierarchy classes
+        // contain both "ArrayQueue" and end with "Chunk" (e.g. MpUnboundedXaddArrayQueueProducerChunk)
+        if (qName.contains("ArrayQueue"))
+        {
+            return qName.replace("ArrayQueue", queueClassNamePrefix + "ArrayQueue");
+        }
+        // Standalone Chunk classes (e.g. MpUnboundedXaddChunk -> MpUnboundedXaddAtomicChunk)
+        if (qName.endsWith("Chunk"))
+        {
+            return qName.replace("Chunk", queueClassNamePrefix + "Chunk");
+        }
+        throw new IllegalArgumentException("Unexpected queue name: " + qName);
+    }
+
+    @Override
+    public final void visit(PackageDeclaration n, Void arg)
+    {
+        super.visit(n, arg);
+        n.setName(outputPackage);
+    }
+
+    /**
+     * Renames Chunk type references (e.g. {@code MpUnboundedXaddChunk} to
+     * {@code MpUnboundedXaddAtomicChunk}) wherever they appear as types: field declarations,
+     * method return types, generic parameters, casts, etc. The {@code contains(prefix)} guard
+     * skips Chunk types that already carry the infix — both ones already renamed by an enclosing
+     * visitor call and standalone references the generator itself synthesises.
+     */
+    @Override
+    public final void visit(ClassOrInterfaceType n, Void arg)
+    {
+        super.visit(n, arg);
+        String name = n.getNameAsString();
+        if (name.endsWith("Chunk") && !name.contains(queueClassNamePrefix))
+        {
+            renameType(n, translateQueueName(name));
+        }
+    }
+
+    /**
+     * Renames Chunk class references in name expressions, e.g. {@code MpmcUnboundedXaddChunk.NOT_USED}.
+     * The {@code isUpperCase} guard avoids renaming local variables like {@code cChunk} that also
+     * end with "Chunk" but are not class names.
+     */
+    @Override
+    public final void visit(NameExpr n, Void arg)
+    {
+        super.visit(n, arg);
+        String name = n.getNameAsString();
+        if (name.endsWith("Chunk") && Character.isUpperCase(name.charAt(0)) && !name.contains(queueClassNamePrefix))
+        {
+            n.setName(translateQueueName(name));
+        }
+    }
+
+    /**
+     * Template-method dispatch for class declaration visiting. The base recursively descends
+     * (calling {@code super.visit}), then invokes the {@link #visitClass} hook for subclass-specific
+     * rewrites, then conditionally strips padding fields based on {@link #stripsPadding}.
+     * Subclasses override {@link #visitClass}; the {@code visit} override itself is final so the
+     * post-visit padding step always runs in the right order.
+     */
+    @Override
+    public final void visit(ClassOrInterfaceDeclaration node, Void arg)
+    {
+        super.visit(node, arg);
+        visitClass(node, arg);
+        if (stripsPadding())
+        {
+            removePaddingFields(node);
+        }
+    }
+
+    /**
+     * Hook called after the recursive visit of a class declaration. Default no-op; concrete
+     * generators override to rewrite class names, parents, methods, and fields.
+     */
+    protected void visitClass(ClassOrInterfaceDeclaration node, Void arg)
+    {
+    }
+
+    /**
+     * Whether this generator strips byte-padding fields and their attached comments. Defaults to
+     * {@code false}; the {@code *Unpadded*} variants override to {@code true}. Centralising the
+     * decision means each concrete generator declares intent in one line rather than overriding
+     * both {@code visit(ClassOrInterfaceDeclaration)} and {@code cleanupComments}.
+     */
+    protected boolean stripsPadding()
+    {
+        return false;
+    }
+
+    /**
+     * Default cleanup pass: drops padding-related comments when {@link #stripsPadding} is true.
+     * Subclasses extend by overriding {@link #cleanupCommentsExtra} rather than this method, so the
+     * padding cleanup always runs.
+     */
+    @Override
+    public final void cleanupComments(com.github.javaparser.ast.CompilationUnit cu)
+    {
+        if (stripsPadding())
+        {
+            cleanupPaddingComments(cu);
+        }
+        cleanupCommentsExtra(cu);
+    }
+
+    /** Hook for subclasses to add extra cleanup passes; default no-op. */
+    protected void cleanupCommentsExtra(com.github.javaparser.ast.CompilationUnit cu)
+    {
+    }
+
+    /**
+     * Renames the parents of {@code n} in its {@code extends} clause according to
+     * {@link #translateQueueName(String)}, leaving {@code AbstractQueue} alone (it is the JDK
+     * parent). Already-translated parents are skipped via the {@code contains(prefix)} guard.
+     */
+    protected final void replaceParentClasses(ClassOrInterfaceDeclaration n)
+    {
+        for (ClassOrInterfaceType parent : n.getExtendedTypes())
+        {
+            String parentName = parent.getNameAsString();
+            if ("AbstractQueue".equals(parentName))
+            {
+                continue;
+            }
+            if (!parentName.contains(queueClassNamePrefix))
+            {
+                parent.setName(translateQueueName(parentName));
+            }
+        }
+    }
+
+    /**
+     * Returns whether {@code node} carries a comment whose trimmed content equals {@code wanted}.
+     * Used to detect {@code $gen:ordered-fields} and {@code $gen:ignore} directives.
+     */
+    protected static boolean isCommentPresent(Node node, String wanted)
+    {
+        Optional<Comment> maybeComment = node.getComment();
+        return maybeComment.isPresent() && wanted.equals(maybeComment.get().getContent().trim());
+    }
+
+    /**
+     * Removes Unsafe-specific static infrastructure: static initializer blocks that reference
+     * {@code Unsafe} or {@code *_OFFSET} (i.e. ones that compute Unsafe field offsets) and static
+     * fields ending with {@code _OFFSET}. Unrelated static initializer blocks and {@code NOT_USED}-
+     * style constants are preserved.
+     * <p>
+     * On a multi-declarator row like {@code static long P_OFFSET = ..., MASK = ...;}, only the
+     * {@code _OFFSET} declarators are dropped — surviving declarators stay on the field.
+     */
+    protected static void removeStaticFieldsAndInitialisers(ClassOrInterfaceDeclaration node)
+    {
+        for (InitializerDeclaration child : node.getChildNodesByType(InitializerDeclaration.class))
+        {
+            if (referencesUnsafe(child))
+            {
+                child.remove();
+            }
+        }
+        for (FieldDeclaration field : node.getFields())
+        {
+            if (!field.getModifiers().contains(Modifier.staticModifier()))
+            {
+                continue;
+            }
+            field.getVariables().removeIf(v -> v.getNameAsString().endsWith("_OFFSET"));
+            if (field.getVariables().isEmpty())
+            {
+                field.remove();
+            }
+        }
+    }
+
+    private static boolean referencesUnsafe(Node node)
+    {
+        for (NameExpr ref : node.findAll(NameExpr.class))
+        {
+            String name = ref.getNameAsString();
+            if ("UNSAFE".equals(name) || "UnsafeAccess".equals(name) || "UnsafeRefArrayAccess".equals(name))
+            {
+                return true;
+            }
+            if (name.endsWith("_OFFSET"))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    protected static String capitalise(String s)
+    {
+        return s.substring(0, 1).toUpperCase() + s.substring(1);
+    }
+
+    protected static ClassOrInterfaceType classType(String className)
+    {
+        return new ClassOrInterfaceType(null, className);
+    }
+
+    protected static ClassOrInterfaceType simpleParametricType(String className, String... typeArgs)
+    {
+        ClassOrInterfaceType type = new ClassOrInterfaceType(null, new SimpleName(className), null);
+        if (typeArgs.length > 0)
+        {
+            NodeList<Type> typeArguments = new NodeList<>();
+            for (String typeArg : typeArgs)
+            {
+                typeArguments.add(classType(typeArg));
+            }
+            type.setTypeArguments(typeArguments);
+        }
+        return type;
+    }
+
+    protected static boolean isRefType(Type in, String className)
+    {
+        if (in instanceof ClassOrInterfaceType)
+        {
+            return className.equals(((ClassOrInterfaceType) in).getNameAsString());
+        }
+        return false;
+    }
+
+    protected static boolean isRefArray(Type in, String refClassName)
+    {
+        if (in instanceof ArrayType)
+        {
+            return isRefType(((ArrayType) in).getComponentType(), refClassName);
+        }
+        return false;
+    }
+
+    protected static MethodCallExpr methodCallExpr(String owner, String method, Expression... args)
+    {
+        MethodCallExpr methodCallExpr = new MethodCallExpr(new NameExpr(owner), method);
+        for (Expression expr : args)
+        {
+            methodCallExpr.addArgument(expr);
+        }
+        return methodCallExpr;
+    }
+
+    /** Generates {@code field = newValue;} as a single-statement block. */
+    protected static BlockStmt fieldAssignment(String fieldName, String valueName)
+    {
+        BlockStmt body = new BlockStmt();
+        body
+            .addStatement(new ExpressionStmt(
+                new AssignExpr(new NameExpr(fieldName), new NameExpr(valueName), AssignExpr.Operator.ASSIGN)));
+        return body;
+    }
+
+    /** Generates {@code return field;} as a single-statement block. */
+    protected static BlockStmt returnField(String fieldName)
+    {
+        BlockStmt body = new BlockStmt();
+        body.addStatement(new ReturnStmt(fieldName));
+        return body;
+    }
+
+    protected static ImportDeclaration staticImportDeclaration(String name)
+    {
+        return new ImportDeclaration(name, true, true);
+    }
+
+    /**
+     * Patches {@code methodToPatch} into a deprecated redirector that forwards to
+     * {@code toMethodName} with the supplied parameters. Used by the array-queue generators to
+     * emit a {@code weakOffer} method that calls back to {@code failFastOffer} with a
+     * {@code @deprecated} Javadoc.
+     */
+    @SuppressWarnings("SameParameterValue")
+    protected static void patchMethodAsDeprecatedRedirector(
+        MethodDeclaration methodToPatch,
+        String toMethodName,
+        Type returnType,
+        Parameter... parameters
+    )
+    {
+        methodToPatch.setType(returnType);
+        for (Parameter parameter : parameters)
+        {
+            methodToPatch.addParameter(parameter);
+        }
+        methodToPatch.addAnnotation(new MarkerAnnotationExpr("Deprecated"));
+        methodToPatch
+            .setJavadocComment(
+                formatMultilineJavadoc(1, "@deprecated This was renamed to " + toMethodName + " please migrate"));
+
+        MethodCallExpr methodCall = methodCallExpr("this", toMethodName);
+        for (Parameter parameter : parameters)
+        {
+            methodCall.addArgument(new NameExpr(parameter.getName()));
+        }
+
+        BlockStmt body = new BlockStmt();
+        body.addStatement(new ReturnStmt(methodCall));
+        methodToPatch.setBody(body);
+    }
+
+    /**
+     * Resolves the erased bound of a single-letter generic type parameter by looking at the class
+     * declaration's type parameters. E.g. for {@code class Foo<R extends Bar<R,E>, E>}, resolving
+     * {@code "R"} returns {@code "Bar"}; resolving {@code "E"} returns {@code "Object"} (no bound).
+     * Throws if the type parameter is not declared on {@code n} at all — that case indicates a
+     * generator bug, not a missing bound, and silently returning {@code "Object"} would emit a
+     * field updater whose declared type is wrong.
+     */
+    protected static String resolveErasedBound(ClassOrInterfaceDeclaration n, String typeParamName)
+    {
+        for (com.github.javaparser.ast.type.TypeParameter tp : n.getTypeParameters())
+        {
+            if (tp.getNameAsString().equals(typeParamName))
+            {
+                NodeList<ClassOrInterfaceType> bounds = tp.getTypeBound();
+                return bounds.isEmpty() ? "Object" : bounds.get(0).getNameAsString();
+            }
+        }
+        throw new IllegalStateException("Type parameter '" + typeParamName + "' not declared on " + n.getNameAsString() +
+            " — cannot resolve its erased bound.");
+    }
+
+    /**
+     * Returns whether {@code cu} contains any {@link ClassOrInterfaceType} whose simple name equals
+     * {@code typeName}. Used by {@code organiseImports} to decide whether a generated import is
+     * actually needed — replaces post-visit boolean side-channels that the visitor used to set.
+     */
+    protected static boolean referencesType(com.github.javaparser.ast.CompilationUnit cu, String typeName)
+    {
+        for (ClassOrInterfaceType t : cu.findAll(ClassOrInterfaceType.class))
+        {
+            if (typeName.equals(t.getNameAsString()))
+            {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Returns the rewritten static import for a Chunk class, or {@code imp} unchanged. E.g.
+     * {@code import static o.j.q.MpmcUnboundedXaddChunk.NOT_USED} becomes
+     * {@code import static <outputPackage>.MpmcUnboundedXadd<prefix>Chunk.NOT_USED}.
+     */
+    protected final ImportDeclaration translateChunkStaticImportOrSelf(ImportDeclaration imp)
+    {
+        String name = imp.getNameAsString();
+        if (!imp.isStatic() || !name.startsWith("org.jctools.queues.") || !name.contains("Chunk."))
+        {
+            return imp;
+        }
+        int lastDot = name.lastIndexOf('.');
+        String simpleName = name.substring(lastDot + 1);
+        String className = name.substring("org.jctools.queues.".length(), lastDot);
+        if (!className.endsWith("Chunk"))
+        {
+            return imp;
+        }
+        return new ImportDeclaration(outputPackage + "." + translateQueueName(className) + "." + simpleName, true, false);
+    }
+}

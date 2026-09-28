@@ -1,0 +1,190 @@
+package org.jctools.queues.atomic;
+
+import com.github.javaparser.JavaParser;
+import com.github.javaparser.ast.CompilationUnit;
+import org.jctools.queues.util.GeneratorUtils;
+import org.junit.Test;
+
+import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
+
+/**
+ * Regression tests for the linked-queue atomic generator. Each test fixes a specific bug uncovered
+ * during the post-LPP review.
+ */
+public class JavaParsingAtomicLinkedQueueGeneratorTest
+{
+
+    private static String generate(String source)
+    {
+        CompilationUnit cu = new JavaParser()
+            .parse(source)
+            .getResult()
+            .orElseThrow(
+                () -> new AssertionError("parse failed"));
+        return GeneratorUtils
+            .applyGenerator(
+                new JavaParsingAtomicLinkedQueueGenerator("Synthetic.java"),
+                cu);
+    }
+
+    /**
+     * Bug 2: the {@code usesFieldUpdater} flag was scoped per-FieldDeclaration instead of
+     * per-VariableDeclarator. With {@code long a, b;} where only {@code a} has accessors, the flag
+     * stayed {@code true} when iterating to {@code b}, causing a stray updater for {@code b}.
+     * Today no jctools source declares two variables in one field, but the regression is real.
+     */
+    @Test
+    public void multiVariableFieldDoesNotEmitStrayUpdaterForUnaccessedVariable()
+    {
+        String src =
+            "package org.jctools.queues;\n" +
+                "// $gen:ordered-fields\n" +
+                "class FooLinkedQueue<E> extends BaseLinkedQueue<E> {\n" +
+                "  private long producerIndex, unrelated;\n" +
+                "  public final long lvProducerIndex() { return 0; }\n" +
+                "  final void soProducerIndex(final long newValue) {}\n" +
+                "}";
+
+        String out = generate(src);
+
+        assertTrue("updater for accessed field: " + out, out.contains("P_INDEX_UPDATER"));
+        assertFalse("no stray updater for unaccessed sibling: " + out, out.contains("UNRELATED_UPDATER"));
+    }
+
+    /**
+     * Bug 5: the linked atomic patcher had no {@code final}-field guard, unlike the array patcher.
+     * A {@code final} non-static field whose name matched a method suffix would otherwise get a
+     * stray updater and a {@code volatile} modifier (which doesn't compile on a {@code final}).
+     */
+    @Test
+    public void finalFieldsAreSkippedByPatcher()
+    {
+        String src =
+            "package org.jctools.queues;\n" +
+                "// $gen:ordered-fields\n" +
+                "class FooLinkedQueue<E> extends BaseLinkedQueue<E> {\n" +
+                "  protected final boolean pooled = false;\n" +
+                "  public final boolean isPooled() { return pooled; }\n" +
+                "}";
+
+        String out = generate(src);
+
+        assertFalse("no updater for final field: " + out, out.contains("POOLED_UPDATER"));
+        assertFalse("no volatile injected on final field: " + out, out.contains("volatile"));
+        assertTrue("isPooled() body untouched: " + out, out.contains("return pooled"));
+    }
+
+    /**
+     * Bug 7: removeStaticFieldsAndInitialisers used to drop ALL static initializer blocks. Only
+     * blocks that reference Unsafe / *_OFFSET infrastructure should be removed; unrelated static
+     * blocks (e.g. one that initialises a non-Unsafe sentinel) must survive.
+     */
+    @Test
+    public void unrelatedStaticInitializerSurvives()
+    {
+        String src =
+            "package org.jctools.queues;\n" +
+                "// $gen:ordered-fields\n" +
+                "class FooLinkedQueue<E> extends BaseLinkedQueue<E> {\n" +
+                "  static int sentinel;\n" +
+                "  static { sentinel = 42; }\n" +
+                "  private long producerIndex;\n" +
+                "  public final long lvProducerIndex() { return 0; }\n" +
+                "  final void soProducerIndex(final long newValue) {}\n" +
+                "}";
+
+        String out = generate(src);
+
+        assertTrue("non-Unsafe initializer preserved: " + out, out.contains("sentinel = 42"));
+    }
+
+    /**
+     * Bug 11: the linked atomic patcher used to call a private declareRefFieldUpdater that
+     * hardcoded the AtomicReferenceFieldUpdater type parameter to LinkedQueueAtomicNode regardless
+     * of the variable's declared type. After the fix it routes through the typed parent overload
+     * with the variable's actual type, so a non-LinkedQueueNode reference field gets the right
+     * updater type. Today no jctools linked source has such a field, but the regression is real.
+     */
+    @Test
+    public void linkedRefFieldUpdaterUsesActualVariableType()
+    {
+        // producerLimit is recognised by the linked generator's fieldUpdaterFieldName mapping
+        // (returns P_LIMIT_UPDATER); the type is intentionally Thread here to exercise the
+        // non-LinkedQueueNode path that previously emitted the wrong updater type.
+        String src =
+            "package org.jctools.queues;\n" +
+                "// $gen:ordered-fields\n" +
+                "class FooLinkedQueue<E> extends BaseLinkedQueue<E> {\n" +
+                "  private Thread producerLimit;\n" +
+                "  public final Thread lvProducerLimit() { return null; }\n" +
+                "  final void soProducerLimit(final Thread newValue) {}\n" +
+                "}";
+
+        String out = generate(src);
+
+        assertTrue("updater typed against Thread: " + out,
+            out.replaceAll("\\s+", " ").contains("AtomicReferenceFieldUpdater<FooLinkedAtomicQueue, Thread> P_LIMIT_UPDATER"));
+        assertFalse("no leftover hard-coded LinkedQueueAtomicNode in updater type: " + out,
+            out.contains("AtomicReferenceFieldUpdater<FooLinkedAtomicQueue, LinkedQueueAtomicNode>"));
+    }
+
+    /**
+     * resolveErasedBound used to silently return "Object" both when a generic parameter had no bound
+     * and when the parameter was not declared on the class at all. The not-declared case indicates a
+     * generator bug and must throw — silently emitting an updater typed against Object would compile
+     * but blow up at static-init time with ClassCastException far from the cause.
+     */
+    @Test
+    public void undeclaredGenericFieldTypeThrows()
+    {
+        // Field type R is a single-letter capital but R is not a type parameter on the class.
+        String src =
+            "package org.jctools.queues;\n" +
+                "// $gen:ordered-fields\n" +
+                "class FooLinkedQueue<E> extends BaseLinkedQueue<E> {\n" +
+                "  private R producerLimit;\n" +
+                "  public final R lvProducerLimit() { return null; }\n" +
+                "  final void soProducerLimit(final R newValue) {}\n" +
+                "}";
+
+        try
+        {
+            generate(src);
+            fail("expected IllegalStateException");
+        }
+        catch (IllegalStateException expected)
+        {
+            assertTrue(expected.getMessage(), expected.getMessage().contains("'R'"));
+            // Class name in the message is the post-translation name (resolveErasedBound runs
+            // after the class has been renamed). Assert on the translated form.
+            assertTrue(expected.getMessage(), expected.getMessage().contains("FooLinkedAtomicQueue"));
+        }
+    }
+
+    /**
+     * removeStaticFieldsAndInitialisers used to drop the entire FieldDeclaration when any one
+     * declarator ended with _OFFSET. A multi-declarator row that combined an _OFFSET constant with
+     * an unrelated sibling would have lost the sibling silently. Today no jctools source declares
+     * one this way; the regression is real.
+     */
+    @Test
+    public void multiDeclaratorOffsetFieldKeepsNonOffsetSibling()
+    {
+        String src =
+            "package org.jctools.queues;\n" +
+                "// $gen:ordered-fields\n" +
+                "class FooLinkedQueue<E> extends BaseLinkedQueue<E> {\n" +
+                "  private static final long P_INDEX_OFFSET = 0L, MASK = 7L;\n" +
+                "  private long producerIndex;\n" +
+                "  public final long lvProducerIndex() { return 0; }\n" +
+                "  final void soProducerIndex(final long newValue) {}\n" +
+                "}";
+
+        String out = generate(src);
+
+        assertFalse("offset declarator removed: " + out, out.contains("P_INDEX_OFFSET"));
+        assertTrue("non-offset sibling preserved: " + out, out.contains("MASK = 7L"));
+    }
+}
